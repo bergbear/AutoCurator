@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Dev-only tools (add as needed)
+pytest==9.0.2
+black==26.1.0
+ruff==0.15.4
