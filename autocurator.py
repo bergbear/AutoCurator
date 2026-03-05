@@ -332,10 +332,13 @@ def weight_item(it, cfg):
 
 def pick_issue(items, store):
     seen = store["seen"]
-    # Prefer unseen
-    candidates = [it for it in items if str(it["id"]) not in seen]
+    skipped = store.get("skipped", {})
+    # Prefer unseen and not explicitly skipped.
+    candidates = [
+        it for it in items if str(it["id"]) not in seen and str(it["id"]) not in skipped
+    ]
     if not candidates:
-        candidates = items
+        candidates = [it for it in items if str(it["id"]) not in skipped]
     if not candidates:
         return None
     weights = [
@@ -355,7 +358,8 @@ def fmt_issue(it):
     updated = it["updated_at"].replace("T", " ").replace("Z", " UTC")
     body = it.get("body") or ""
     body = textwrap.shorten(" ".join(body.split()), width=220, placeholder="…")
-    return textwrap.dedent(f"""
+    return textwrap.dedent(
+        f"""
     ── 🎯 Auto-Curator pick ─────────────────────────────
     Repo     : {repo}  ⭐ {stars}
     Title    : {title}
@@ -364,7 +368,8 @@ def fmt_issue(it):
     Link     : {url}
     Summary  : {body}
     Actions  : [o] open  [s] save  [k] skip  [q] quit
-    """).strip()
+    """
+    ).strip()
 
 
 def interactive_loop(issue, store):
@@ -374,7 +379,7 @@ def interactive_loop(issue, store):
             choice = input("> ").strip().lower()
         except KeyboardInterrupt:
             print("\nInterrupted. Returning to shell.")
-            break
+            return "quit"
         if choice in ("o", "open"):
             webbrowser.open(issue["html_url"])
         elif choice in ("s", "save"):
@@ -388,9 +393,9 @@ def interactive_loop(issue, store):
         elif choice in ("k", "skip"):
             store["skipped"][str(issue["id"])] = True
             print("skipped")
-            break
+            return "skip"
         elif choice in ("q", "quit", "exit"):
-            break
+            return "quit"
         else:
             print("Commands: o=open  s=save  k=skip  q=quit")
 
@@ -403,14 +408,22 @@ def cmd_next(args):
     if not items:
         print("No candidates found. Try widening filters (languages, min_stars).")
         return
-    it = pick_issue(items, store)
-    if not it:
-        print("Nothing to pick.")
-        return
-    store["seen"][str(it["id"])] = True
-    save_store(store)
-    interactive_loop(it, store)
-    save_store(store)
+
+    while True:
+        it = pick_issue(items, store)
+        if not it:
+            print("No more candidates available right now.")
+            break
+
+        store["seen"][str(it["id"])] = True
+        save_store(store)
+
+        action = interactive_loop(it, store)
+        save_store(store)
+
+        if action == "skip":
+            continue
+        break
 
 
 def cmd_config(args):
@@ -521,11 +534,32 @@ def cmd_autotune(args):
 def cmd_saved(args):
     store = load_store()
     saved = store.get("saved", {})
+
+    if args.remove:
+        issue_id = str(args.remove)
+        if issue_id not in saved:
+            print(f"Saved issue not found: {issue_id}")
+            return
+        removed = saved.pop(issue_id)
+        save_store(store)
+        print(f"Removed saved issue {issue_id}: {removed['title']}")
+        return
+
+    if args.clear:
+        if not saved:
+            print("No saved issues.")
+            return
+        count = len(saved)
+        saved.clear()
+        save_store(store)
+        print(f"Cleared {count} saved issue(s).")
+        return
+
     if not saved:
         print("No saved issues.")
         return
     for k, v in saved.items():
-        print(f"- {v['title']} [{v['repo']}] -> {v['url']}")
+        print(f"- {k}: {v['title']} [{v['repo']}] -> {v['url']}")
 
 
 def cmd_auth(args):
@@ -596,7 +630,17 @@ def main():
     sub.add_parser(
         "next", help="fetch & show a curated issue (interactive)"
     ).set_defaults(func=cmd_next)
-    sub.add_parser("saved", help="list saved issues").set_defaults(func=cmd_saved)
+    s = sub.add_parser("saved", help="list/remove/clear saved issues")
+    mut = s.add_mutually_exclusive_group()
+    mut.add_argument(
+        "--remove",
+        "--rm",
+        metavar="ISSUE_ID",
+        dest="remove",
+        help="remove one saved issue",
+    )
+    mut.add_argument("--clear", action="store_true", help="remove all saved issues")
+    s.set_defaults(func=cmd_saved)
     sub.add_parser("readme", help="display the project README").set_defaults(
         func=cmd_readme
     )
