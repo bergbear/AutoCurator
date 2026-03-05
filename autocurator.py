@@ -40,6 +40,10 @@ if GITHUB_TOKEN:
     HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
 
+class GitHubRateLimitError(RuntimeError):
+    pass
+
+
 def load_store():
     if STORE.exists():
         try:
@@ -68,29 +72,74 @@ def get_reference_now_utc():
     return datetime.utcnow()
 
 
-def build_issue_query(cfg, now_utc=None, label=None, language=None):
+def normalize_query_terms(raw_terms):
+    if not raw_terms:
+        return []
+    terms = []
+    for raw in raw_terms:
+        for part in str(raw).split(","):
+            term = part.strip()
+            if term and term not in terms:
+                terms.append(term)
+    return terms
+
+
+def raise_for_github_rate_limit(response):
+    is_rate_limited = response.status_code == 403 and (
+        "rate limit" in response.text.lower()
+        or response.headers.get("X-RateLimit-Remaining") == "0"
+    )
+    if not is_rate_limited:
+        return
+
+    reset_at = "unknown"
+    reset_ts = response.headers.get("X-RateLimit-Reset")
+    if reset_ts and str(reset_ts).isdigit():
+        reset_at = datetime.utcfromtimestamp(int(reset_ts)).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+
+    if GITHUB_TOKEN:
+        raise GitHubRateLimitError(
+            f"Rate limited by GitHub. Try again after {reset_at} or reduce page_size/max_pages."
+        )
+
+    raise GitHubRateLimitError(
+        f"Rate limited by GitHub. Add GITHUB_TOKEN in .env and run `autocurator.py auth` (reset: {reset_at})."
+    )
+
+
+def build_issue_query(cfg, now_utc=None, label=None, language=None, query_terms=None):
     now_utc = now_utc or datetime.utcnow()
     q_parts = []
     # Type & state
-    q_parts += ["is:issue", "is:open"]
+    q_parts += ["is:issue", "is:open", "no:assignee"]
     if label:
         q_parts.append(f'label:"{label}"')
     if language:
         q_parts.append(f"language:{language}")
+    for term in query_terms or []:
+        q_parts.append(f'"{term}"' if any(ch.isspace() for ch in term) else term)
     # Freshness
     since = (now_utc - timedelta(days=cfg["updated_within_days"])).date().isoformat()
     q_parts.append(f"updated:>={since}")
     return " ".join(q_parts)
 
 
-def build_issue_queries(cfg, now_utc=None):
+def build_issue_queries(cfg, now_utc=None, query_terms=None):
     labels = cfg.get("labels") or [None]
     languages = cfg.get("languages") or [None]
     queries = []
     for label in labels:
         for language in languages:
             queries.append(
-                build_issue_query(cfg, now_utc=now_utc, label=label, language=language)
+                build_issue_query(
+                    cfg,
+                    now_utc=now_utc,
+                    label=label,
+                    language=language,
+                    query_terms=query_terms,
+                )
             )
     return queries
 
@@ -98,6 +147,9 @@ def build_issue_queries(cfg, now_utc=None):
 def filter_items(items, cfg):
     def drop(it):
         if it.get("_archived"):
+            return True
+        assignees = it.get("assignees") or []
+        if it.get("assignee") or assignees:
             return True
         if it.get("_stars", 0) < cfg["min_stars"]:
             return True
@@ -109,9 +161,9 @@ def filter_items(items, cfg):
     return [it for it in items if not drop(it)]
 
 
-def gh_search_issues(cfg, now_utc=None):
+def gh_search_issues(cfg, now_utc=None, query_terms=None):
     base = "https://api.github.com/search/issues"
-    queries = build_issue_queries(cfg, now_utc=now_utc)
+    queries = build_issue_queries(cfg, now_utc=now_utc, query_terms=query_terms)
     # GitHub issue search does not behave well with OR+language; fan out queries and union results.
     all_items = []
     seen_issue_ids = set()
@@ -127,8 +179,7 @@ def gh_search_issues(cfg, now_utc=None):
         for page in range(1, cfg["max_pages"] + 1):
             params["page"] = page
             r = requests.get(base, headers=HEADERS, params=params, timeout=20)
-            if r.status_code == 403 and "rate limit" in r.text.lower():
-                raise RuntimeError("Rate limited by GitHub. Add GITHUB_TOKEN.")
+            raise_for_github_rate_limit(r)
             r.raise_for_status()
             data = r.json()
             items = data.get("items", [])
@@ -164,9 +215,9 @@ def gh_search_issues(cfg, now_utc=None):
     return all_items
 
 
-def gh_search_issues_with_stats(cfg, now_utc=None):
+def gh_search_issues_with_stats(cfg, now_utc=None, query_terms=None):
     base = "https://api.github.com/search/issues"
-    queries = build_issue_queries(cfg, now_utc=now_utc)
+    queries = build_issue_queries(cfg, now_utc=now_utc, query_terms=query_terms)
     all_items = []
     seen_issue_ids = set()
     seen_repo = {}
@@ -181,8 +232,7 @@ def gh_search_issues_with_stats(cfg, now_utc=None):
         for page in range(1, cfg["max_pages"] + 1):
             params["page"] = page
             r = requests.get(base, headers=HEADERS, params=params, timeout=20)
-            if r.status_code == 403 and "rate limit" in r.text.lower():
-                raise RuntimeError("Rate limited by GitHub. Add GITHUB_TOKEN.")
+            raise_for_github_rate_limit(r)
             r.raise_for_status()
             data = r.json()
             items = data.get("items", [])
@@ -403,8 +453,17 @@ def interactive_loop(issue, store):
 def cmd_next(args):
     store = load_store()
     cfg = store.get("config", DEFAULT_CONFIG)
+    query_terms = normalize_query_terms(getattr(args, "query", None))
     now_utc = get_reference_now_utc()
-    items = gh_search_issues(cfg, now_utc=now_utc)
+    queries = build_issue_queries(cfg, now_utc=now_utc, query_terms=query_terms)
+    print(f"Search queries ({len(queries)}):")
+    for q in queries:
+        print(f"  {q}")
+    try:
+        items = gh_search_issues(cfg, now_utc=now_utc, query_terms=query_terms)
+    except GitHubRateLimitError as exc:
+        print(exc)
+        return
     if not items:
         print("No candidates found. Try widening filters (languages, min_stars).")
         return
@@ -453,7 +512,11 @@ def cmd_diagnose(args):
     store = load_store()
     cfg = store.get("config", DEFAULT_CONFIG)
     now_utc = get_reference_now_utc()
-    _, stats = gh_search_issues_with_stats(cfg, now_utc=now_utc)
+    try:
+        _, stats = gh_search_issues_with_stats(cfg, now_utc=now_utc)
+    except GitHubRateLimitError as exc:
+        print(exc)
+        return
     print(f"Queries tested: {len(stats['queries'])}")
     for q in stats["queries"][:3]:
         print(f"  {q}")
@@ -499,7 +562,11 @@ def cmd_autotune(args):
     print(f"Autotune: evaluating {len(candidates)} candidate configs...")
     for idx, cfg in enumerate(candidates, start=1):
         probe_cfg = build_autotune_probe_cfg(cfg)
-        _, stats = gh_search_issues_with_stats(probe_cfg, now_utc=now_utc)
+        try:
+            _, stats = gh_search_issues_with_stats(probe_cfg, now_utc=now_utc)
+        except GitHubRateLimitError as exc:
+            print(exc)
+            return
         results.append({"cfg": cfg, "stats": stats})
         print(
             f"  [{idx}] final={stats['final']:>4} raw={stats['raw']:>4} "
@@ -627,9 +694,14 @@ def main():
     )
     sub = ap.add_subparsers(dest="cmd")
 
-    sub.add_parser(
-        "next", help="fetch & show a curated issue (interactive)"
-    ).set_defaults(func=cmd_next)
+    n = sub.add_parser("next", help="fetch & show a curated issue (interactive)")
+    n.add_argument(
+        "--query",
+        action="append",
+        metavar="KEYWORD",
+        help="keyword to include in issue search, repeatable",
+    )
+    n.set_defaults(func=cmd_next)
     s = sub.add_parser("saved", help="list/remove/clear saved issues")
     mut = s.add_mutually_exclusive_group()
     mut.add_argument(

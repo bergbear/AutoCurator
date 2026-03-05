@@ -2,6 +2,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -62,6 +63,11 @@ def test_pick_issue_ignores_skipped_candidates():
     assert selected["id"] == 1
 
 
+def test_normalize_query_terms_splits_commas_and_dedupes():
+    terms = autocurator.normalize_query_terms(["chess, flask", "flask", "api"])
+    assert terms == ["chess", "flask", "api"]
+
+
 def test_build_issue_query_includes_single_label_and_language_filters():
     cfg = {
         "labels": ["good first issue", "help wanted"],
@@ -77,7 +83,45 @@ def test_build_issue_query_includes_single_label_and_language_filters():
     )
     assert 'label:"good first issue"' in query
     assert "language:python" in query
+    assert "no:assignee" in query
     assert "updated:>=2026-02-02" in query
+
+
+def test_filter_items_drops_assigned_issues():
+    cfg = {
+        "min_stars": 0,
+        "exclude_terms": [],
+    }
+    assigned = {"id": 1, "_stars": 100, "_archived": False, "assignee": {"login": "x"}}
+    unassigned = {
+        "id": 2,
+        "_stars": 100,
+        "_archived": False,
+        "assignee": None,
+        "assignees": [],
+    }
+
+    filtered = autocurator.filter_items([assigned, unassigned], cfg)
+
+    assert [it["id"] for it in filtered] == [2]
+
+
+def test_build_issue_query_includes_query_terms():
+    cfg = {
+        "labels": ["good first issue"],
+        "languages": ["python"],
+        "updated_within_days": 30,
+    }
+
+    query = autocurator.build_issue_query(
+        cfg,
+        now_utc=datetime(2026, 3, 4),
+        label="good first issue",
+        language="python",
+        query_terms=["flask", "chess engine"],
+    )
+    assert "flask" in query
+    assert '"chess engine"' in query
 
 
 def test_build_issue_queries_fans_out_label_language_pairs():
@@ -251,7 +295,7 @@ def test_cmd_next_skip_fetches_next_candidate(monkeypatch):
     monkeypatch.setattr(
         autocurator,
         "gh_search_issues",
-        lambda cfg, now_utc=None: [issue_1, issue_2],
+        lambda cfg, now_utc=None, query_terms=None: [issue_1, issue_2],
     )
     picks = iter([issue_1, issue_2])
     monkeypatch.setattr(
@@ -270,3 +314,129 @@ def test_cmd_next_skip_fetches_next_candidate(monkeypatch):
     autocurator.cmd_next(SimpleNamespace())
 
     assert shown_ids == [1, 2]
+
+
+def test_cmd_next_passes_query_terms_to_search(monkeypatch):
+    store = {
+        "seen": {},
+        "saved": {},
+        "skipped": {},
+        "config": autocurator.DEFAULT_CONFIG,
+    }
+    captured = {}
+
+    monkeypatch.setattr(autocurator, "load_store", lambda: store)
+    monkeypatch.setattr(autocurator, "get_reference_now_utc", lambda: datetime.utcnow())
+
+    def fake_search(cfg, now_utc=None, query_terms=None):
+        captured["query_terms"] = query_terms
+        return []
+
+    monkeypatch.setattr(autocurator, "gh_search_issues", fake_search)
+
+    autocurator.cmd_next(SimpleNamespace(query=["chess, flask", "flask"]))
+
+    assert captured["query_terms"] == ["chess", "flask"]
+
+
+def test_cmd_next_displays_queries_before_search(monkeypatch, capsys):
+    store = {
+        "seen": {},
+        "saved": {},
+        "skipped": {},
+        "config": autocurator.DEFAULT_CONFIG,
+    }
+
+    monkeypatch.setattr(autocurator, "load_store", lambda: store)
+    monkeypatch.setattr(autocurator, "get_reference_now_utc", lambda: datetime.utcnow())
+    monkeypatch.setattr(autocurator, "gh_search_issues", lambda *args, **kwargs: [])
+
+    autocurator.cmd_next(SimpleNamespace(query=["flask"]))
+    out = capsys.readouterr().out
+
+    assert "Search queries (" in out
+    assert "flask" in out
+
+
+def test_raise_for_github_rate_limit_raises_with_reset(monkeypatch):
+    monkeypatch.setattr(autocurator, "GITHUB_TOKEN", "")
+    response = Mock()
+    response.status_code = 403
+    response.text = "API rate limit exceeded"
+    response.headers = {
+        "X-RateLimit-Remaining": "0",
+        "X-RateLimit-Reset": "1767225600",
+    }
+
+    try:
+        autocurator.raise_for_github_rate_limit(response)
+        assert False, "Expected GitHubRateLimitError"
+    except autocurator.GitHubRateLimitError as exc:
+        assert "Add GITHUB_TOKEN" in str(exc)
+        assert "reset:" in str(exc)
+
+
+def test_cmd_next_handles_rate_limit_without_traceback(monkeypatch, capsys):
+    store = {
+        "seen": {},
+        "saved": {},
+        "skipped": {},
+        "config": autocurator.DEFAULT_CONFIG,
+    }
+
+    monkeypatch.setattr(autocurator, "load_store", lambda: store)
+    monkeypatch.setattr(autocurator, "get_reference_now_utc", lambda: datetime.utcnow())
+
+    def fake_search(cfg, now_utc=None, query_terms=None):
+        raise autocurator.GitHubRateLimitError("Rate limited by GitHub.")
+
+    monkeypatch.setattr(autocurator, "gh_search_issues", fake_search)
+
+    autocurator.cmd_next(SimpleNamespace(query=["flask"]))
+    out = capsys.readouterr().out
+
+    assert "Rate limited by GitHub." in out
+
+
+def test_cmd_diagnose_handles_rate_limit_without_traceback(monkeypatch, capsys):
+    store = {
+        "seen": {},
+        "saved": {},
+        "skipped": {},
+        "config": autocurator.DEFAULT_CONFIG,
+    }
+
+    monkeypatch.setattr(autocurator, "load_store", lambda: store)
+    monkeypatch.setattr(autocurator, "get_reference_now_utc", lambda: datetime.utcnow())
+
+    def fake_with_stats(cfg, now_utc=None, query_terms=None):
+        raise autocurator.GitHubRateLimitError("Rate limited by GitHub.")
+
+    monkeypatch.setattr(autocurator, "gh_search_issues_with_stats", fake_with_stats)
+
+    autocurator.cmd_diagnose(SimpleNamespace())
+    out = capsys.readouterr().out
+
+    assert "Rate limited by GitHub." in out
+
+
+def test_cmd_autotune_handles_rate_limit_without_traceback(monkeypatch, capsys):
+    store = {
+        "seen": {},
+        "saved": {},
+        "skipped": {},
+        "config": autocurator.DEFAULT_CONFIG,
+    }
+
+    monkeypatch.setattr(autocurator, "load_store", lambda: store)
+    monkeypatch.setattr(autocurator, "get_reference_now_utc", lambda: datetime.utcnow())
+
+    def fake_with_stats(cfg, now_utc=None, query_terms=None):
+        raise autocurator.GitHubRateLimitError("Rate limited by GitHub.")
+
+    monkeypatch.setattr(autocurator, "gh_search_issues_with_stats", fake_with_stats)
+
+    autocurator.cmd_autotune(SimpleNamespace(dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "Rate limited by GitHub." in out

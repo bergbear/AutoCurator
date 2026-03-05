@@ -51,6 +51,8 @@ Quick full health check:
 
 ```powershell
 .\.venv\Scripts\python.exe autocurator.py next
+.\.venv\Scripts\python.exe autocurator.py next --query chess
+.\.venv\Scripts\python.exe autocurator.py next --query flask --query api
 .\.venv\Scripts\python.exe autocurator.py saved
 .\.venv\Scripts\python.exe autocurator.py saved --remove 123456789
 .\.venv\Scripts\python.exe autocurator.py saved --rm 123456789
