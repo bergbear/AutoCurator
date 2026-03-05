@@ -355,8 +355,7 @@ def fmt_issue(it):
     updated = it["updated_at"].replace("T", " ").replace("Z", " UTC")
     body = it.get("body") or ""
     body = textwrap.shorten(" ".join(body.split()), width=220, placeholder="…")
-    return textwrap.dedent(
-        f"""
+    return textwrap.dedent(f"""
     ── 🎯 Auto-Curator pick ─────────────────────────────
     Repo     : {repo}  ⭐ {stars}
     Title    : {title}
@@ -365,8 +364,7 @@ def fmt_issue(it):
     Link     : {url}
     Summary  : {body}
     Actions  : [o] open  [s] save  [k] skip  [q] quit
-    """
-    ).strip()
+    """).strip()
 
 
 def interactive_loop(issue, store):

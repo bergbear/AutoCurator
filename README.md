@@ -59,6 +59,7 @@ Quick full health check:
 .\.venv\Scripts\python.exe autocurator.py diagnose
 .\.venv\Scripts\python.exe autocurator.py autotune
 .\.venv\Scripts\python.exe autocurator.py autotune --dry-run
+.\scripts\save_top5.ps1
 ```
 
 ## Quality checks
